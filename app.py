@@ -14,6 +14,21 @@ import textwrap
 from openai import OpenAI
 from dotenv import load_dotenv
 import time
+import asyncio
+import sounddevice as sd  # For audio input/output
+import numpy as np
+from openai import AsyncOpenAI
+from typing import Any, cast
+import base64
+from openai.resources.beta.realtime.realtime import AsyncRealtimeConnection
+import pyaudio
+import threading
+import pyttsx3
+
+from pydub import AudioSegment
+from io import BytesIO
+from pydub.playback import play
+
 
 # Load environment variables
 load_dotenv()
@@ -149,6 +164,102 @@ def draw_sphere(radius, slices, stacks):
             glVertex3f(x * zr1 * radius, y * zr1 * radius, z1 * radius)
         glEnd()
 
+CHANNELS = 1
+SAMPLE_RATE = 16000
+class AudioPlayerAsync:
+    """
+    A delightful audio player that adjusts the pitch for a feminine speech style.
+    """
+
+    def __init__(self, chunk_size=1024, pitch_factor=1.2):
+        """
+        Initializes the audio player with pitch adjustment.
+
+        Args:
+            chunk_size (int): The size of each audio chunk for smooth processing.
+            pitch_factor (float): The factor by which to raise the pitch (greater than 1 increases pitch).
+        """
+        self.audio = pyaudio.PyAudio()
+        self.stream = None
+        self.frame_count = 0
+        self.chunk_size = chunk_size
+        self.max_frames = 300
+        self.pitch_factor = pitch_factor  
+
+    def reset_frame_count(self):
+        """Resets the frame count to start fresh."""
+        self.frame_count = 0
+
+    def _adjust_pitch(self, audio_segment):
+        """
+        Adjusts the pitch of the audio segment to make it sound more feminine.
+
+        Args:
+            audio_segment (AudioSegment): The audio to modify.
+
+        Returns:
+            AudioSegment: The pitch-modified audio.
+        """
+        # Adjust pitch by changing playback speed
+        return audio_segment._spawn(audio_segment.raw_data, overrides={
+            "frame_rate": int(audio_segment.frame_rate * self.pitch_factor)
+        }).set_frame_rate(SAMPLE_RATE)
+
+    def add_data(self, data) -> None:
+        """
+        Adds new audio data to be played with a feminine touch.
+
+        Args:
+            data (bytes): The raw audio data to play.
+        """
+        if not data:
+            return
+        
+        # Convert raw bytes into an AudioSegment
+        audio_segment = AudioSegment.from_file(BytesIO(data), format="raw", frame_rate=SAMPLE_RATE, channels=CHANNELS, sample_width=2)
+        
+        # Adjust the pitch to sound more feminine
+        pitched_audio = self._adjust_pitch(audio_segment)
+        
+        # Convert the adjusted audio back to a numpy array
+        numpy_array = np.array(pitched_audio.get_array_of_samples(), dtype=np.int16)
+        self._play_data(numpy_array)
+
+    def _play_data(self, data):
+        """
+        Streams the audio data to the speakers, chunk by chunk.
+
+        Args:
+            data (np.ndarray): The prepared audio samples.
+        """
+        if self.stream is None:
+            self.stream = self.audio.open(
+                format=pyaudio.paInt16,
+                channels=CHANNELS,
+                rate=SAMPLE_RATE,
+                output=True
+            )
+
+        chunk_size = self.chunk_size
+        for i in range(0, len(data), chunk_size):
+            chunk = data[i:i + chunk_size]
+
+            # Stop playback if we exceed the frame limit
+            if self.frame_count > self.max_frames:
+                return
+
+            self.stream.write(chunk.tobytes())
+            self.frame_count += 1
+
+    def close(self):
+        """Closes the audio player gracefully."""
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+        self.audio.terminate()
+
+   
+
 class DialogueSystem:
     def __init__(self):
         self.active = False
@@ -171,39 +282,30 @@ class DialogueSystem:
         self.current_npc = None  # Track which NPC we're talking to
         self.initial_player_pos = None  # Store initial position when dialogue starts
 
-    def render_text(self, surface, text, x, y):
-        max_width = WINDOW_WIDTH - 40
-        line_height = 25
-        
-        words = text.split()
-        lines = []
-        current_line = []
-        current_width = 0
-        
-        # Always use pure white with full opacity
-        text_color = (255, 255, 255)
-        
-        for word in words:
-            word_surface = self.font.render(word + ' ', True, text_color)
-            word_width = word_surface.get_width()
-            
-            if current_width + word_width <= max_width:
-                current_line.append(word)
-                current_width += word_width
-            else:
-                lines.append(' '.join(current_line))
-                current_line = [word]
-                current_width = word_width
-        
-        if current_line:
-            lines.append(' '.join(current_line))
-        
-        # Render each line in pure white
-        for i, line in enumerate(lines):
-            text_surface = self.font.render(line, True, (255, 255, 255))  # Force white color
-            surface.blit(text_surface, (x, y + i * line_height))
-        
-        return len(lines) * line_height
+        # OpenAI Realtime API components
+        self.client = AsyncOpenAI()
+        self.connection = None
+        self.session = None
+        self.connected = asyncio.Event()
+        self.should_send_audio = asyncio.Event()
+        self.last_audio_item_id = None
+
+        # Audio data queue
+        self.audio_queue = asyncio.Queue()
+        self.new_text_queue = asyncio.Queue()
+        self.audio_player = None  # We'll start the audio player when we need it
+
+        self.audio_thread = None
+        self.realtime_task = None
+        self.audio_processing_task = None
+    
+    def _run_async(self):
+        asyncio.run(self.async_loop())
+    
+    async def async_loop(self):
+        self.realtime_task = asyncio.create_task(self.handle_realtime_connection())
+        self.audio_processing_task = asyncio.create_task(self._process_audio_queue())
+        await self.send_mic_audio()
 
     def start_conversation(self, npc_role="HR", player_pos=None):
         self.active = True
@@ -305,7 +407,7 @@ class DialogueSystem:
             "CEO": "Hello! I'm Michael, the CEO of Venture Builder AI. What can I do for you today?"
         }
 
-            
+        
         # Set the NPC's greeting as the current message
         self.npc_message = initial_message[npc_role]
         
@@ -314,16 +416,175 @@ class DialogueSystem:
             "role": "system",
             "content": system_prompt
         }]
-        
-        print(f"[DialogueSystem] Dialogue started with {npc_role}")
 
-    def send_message(self):
+        # Start the asynchronous tasks
+        self.audio_thread = threading.Thread(target=self._run_async, daemon=True)
+        self.audio_thread.start()
+
+        print(f"[DialogueSystem] Dialogue started with {npc_role}")
+    
+    def render_text(self, surface, text, x, y):
+        max_width = WINDOW_WIDTH - 40
+        line_height = 25
+        
+        words = text.split()
+        lines = []
+        current_line = []
+        current_width = 0
+        
+        # Always use pure white with full opacity
+        text_color = (255, 255, 255)
+        
+        for word in words:
+            word_surface = self.font.render(word + ' ', True, text_color)
+            word_width = word_surface.get_width()
+            
+            if current_width + word_width <= max_width:
+                current_line.append(word)
+                current_width += word_width
+            else:
+                lines.append(' '.join(current_line))
+                current_line = [word]
+                current_width = word_width
+        
+        if current_line:
+            lines.append(' '.join(current_line))
+        
+        # Render each line in pure white
+        for i, line in enumerate(lines):
+            text_surface = self.font.render(line, True, (255, 255, 255))  # Force white color
+            surface.blit(text_surface, (x, y + i * line_height))
+        
+        return len(lines) * line_height
+
+
+    async def handle_realtime_connection(self) -> None:
+        async with self.client.beta.realtime.connect(model="gpt-4o-realtime-preview-2024-10-01") as conn:
+            self.connection = conn
+            self.connected.set()
+
+            # note: this is the default and can be omitted
+            # if you want to manually handle VAD yourself, then set 'turn_detection': None
+            await conn.session.update(session={"turn_detection": {"type": "server_vad"}})
+
+            acc_items: dict[str, Any] = {}
+
+            async for event in conn:
+                if event.type == "session.created":
+                    self.session = event.session
+                    assert event.session.id is not None
+                    continue
+
+                if event.type == "session.updated":
+                    self.session = event.session
+                    continue
+
+                if event.type == "response.audio.delta":
+                    if event.item_id != self.last_audio_item_id:
+                        self.audio_player.reset_frame_count()
+                        self.last_audio_item_id = event.item_id
+
+                    bytes_data = base64.b64decode(event.delta)
+                    await self.audio_queue.put(bytes_data)
+                    continue
+
+                if event.type == "response.audio_transcript.delta":
+                    try:
+                        text = acc_items[event.item_id]
+                    except KeyError:
+                        acc_items[event.item_id] = event.delta
+                    else:
+                        acc_items[event.item_id] = text + event.delta
+
+                    # Put the full message in queue
+                    await self.new_text_queue.put(acc_items[event.item_id])
+                    continue
+                
+            
+
+    async def _process_audio_queue(self):
+        # from audio_util import AudioPlayerAsync  # Lazy import to prevent blocking init
+        self.audio_player = AudioPlayerAsync()  # Initialize now
+
+        while True:
+            audio_data = await self.audio_queue.get()
+            if audio_data is None:
+                break
+            self.audio_player.add_data(audio_data)
+            self.audio_queue.task_done()
+
+    async def _get_connection(self) -> AsyncRealtimeConnection:
+            await self.connected.wait()
+            assert self.connection is not None
+            return self.connection
+    
+    async def send_mic_audio(self) -> None:
+        sent_audio = False
+
+        device_info = sd.query_devices()
+        print(device_info)
+
+        read_size = int(SAMPLE_RATE * 0.02)
+
+        stream = sd.InputStream(
+            channels=CHANNELS,
+            samplerate=SAMPLE_RATE,
+            dtype="int16",
+        )
+        stream.start()
+
+        try:
+            while self.active:
+                if stream.read_available < read_size:
+                    await asyncio.sleep(0)
+                    continue
+                
+                await self.should_send_audio.wait()
+
+                data, _ = stream.read(read_size)
+
+                connection = await self._get_connection()
+                if not sent_audio:
+                    asyncio.create_task(connection.send({"type": "response.cancel"}))
+                    sent_audio = True
+
+                await connection.input_audio_buffer.append(audio=base64.b64encode(cast(Any, data)).decode("utf-8"))
+                await asyncio.sleep(0)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stream.stop()
+            stream.close()
+            print("[DialogueSystem] Microphone stream stopped.")
+    
+    def _stop_async(self):
+        if self.audio_thread:
+            self.should_send_audio.clear()
+            self.audio_queue.put_nowait(None) # Signal the audio queue to terminate
+            self.audio_thread.join()
+            print("[DialogueSystem] Audio thread stopped")
+            self.audio_thread = None
+
+    def stop_conversation(self):
+        self._stop_async()  # Stop audio processing first
+        if self.realtime_task:
+            self.realtime_task.cancel()
+            self.realtime_task = None
+        if self.audio_processing_task:
+            self.audio_processing_task.cancel()
+            self.audio_processing_task = None
+
+        self.active = False
+        self.input_active = False
+        print("[DialogueSystem] Conversation ended.")
+    
+    async def send_message(self):
         if not self.conversation_history:
             print("[DialogueSystem] No conversation history to send.")
             return
 
         try:
-            response = client.chat.completions.create(
+            response = await self.client.chat.completions.create(
                 model="gpt-4-0125-preview",  # or your current model
                 messages=self.conversation_history,
                 temperature=0.85,
@@ -421,7 +682,7 @@ class DialogueSystem:
         glPopMatrix()
         glPopAttrib()
 
-    def handle_input(self, event):
+    async def handle_input(self, event):
         if not self.active or not self.input_active:
             return
 
@@ -429,27 +690,64 @@ class DialogueSystem:
             # Check for Shift+Q to exit chat
             keys = pygame.key.get_pressed()
             if keys[pygame.K_LSHIFT] and event.key == pygame.K_q:
-                self.active = False
-                self.input_active = False
-                print("[DialogueSystem] Chat ended")
-                # Return both the command and the initial position
+                self.stop_conversation()
                 return {"command": "move_player_back", "position": self.initial_player_pos}
 
             if event.key == pygame.K_RETURN and self.user_input.strip():
                 print(f"[DialogueSystem] User said: {self.user_input}")
-                
+
                 # Add user message to conversation history
                 self.conversation_history.append({"role": "user", "content": self.user_input.strip()})
-                
-                # Clear user input
-                self.user_input = ""
 
                 # Send message to AI
-                self.send_message()
+                asyncio.create_task(self.send_message())
+                print("[DialogueSystem] Sending user message to AI")
+                self._convert_text_to_audio(self.user_input)
+                print("[DialogueSystem] Converting text to audio")
+                self.user_input = ""
             elif event.key == pygame.K_BACKSPACE:
                 self.user_input = self.user_input[:-1]
             elif event.unicode.isprintable():
                 self.user_input += event.unicode
+
+            if event.key == pygame.K_k:
+                if self.should_send_audio.is_set():
+                    self.should_send_audio.clear()
+                    if self.session and self.session.turn_detection is None:
+                        await self._send_commit_and_create_response()
+                else:
+                    self.should_send_audio.set()
+                    print("[DialogueSystem] Recording Started")
+
+    def _convert_text_to_audio(self, text):
+        # Convert text to speech using pyttsx3
+        speech = pyttsx3.init()
+        speech.setProperty('volume', 1.0)
+        voices = speech.getProperty('voices')
+        for index, voice in enumerate(voices):
+            print(f"Voice {index}: {voice.name} - {voice.id}")
+        if len(voices) > 1:
+            speech.setProperty('voice', voices[1].id)
+
+        speech.say(text)
+        speech.runAndWait()
+
+        
+        async def _send_commit_and_create_response(self):
+            conn = await self._get_connection()
+            await conn.input_audio_buffer.commit()
+            await conn.response.create()
+        
+        def update(self):
+            if not self.active:
+                return
+            #Check if we have new text
+            try:
+                new_text = self.new_text_queue.get_nowait()
+                self.npc_message = new_text  # Update the displayed message with the full text
+            except asyncio.QueueEmpty:
+                pass #No new text so keep looping
+        
 
 class World:
     def __init__(self):
