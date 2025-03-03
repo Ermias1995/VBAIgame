@@ -25,13 +25,17 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 print("[OpenAI] API key loaded successfully.")
 
+os.environ['SDL_VIDEODRIVER'] = 'windib'
+
 # Initialize Pygame with macOS specific settings
 pygame.init()
+pygame.display.init()
 display = (800, 600)
 pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 2)
 pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 1)
 pygame.display.set_mode(display, DOUBLEBUF|OPENGL)
 screen = pygame.display.get_surface()
+
 
 # Set up the camera and perspective
 glEnable(GL_DEPTH_TEST)
@@ -959,4 +963,3 @@ class Game3D:
 # Create and run game
 game = Game3D()
 game.run()
-
