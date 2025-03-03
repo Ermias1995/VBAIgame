@@ -205,7 +205,7 @@ class AudioPlayerAsync:
             "frame_rate": int(audio_segment.frame_rate * self.pitch_factor)
         }).set_frame_rate(SAMPLE_RATE)
 
-    def add_data(self, data) -> None:
+    def add_data(self, data:bytes) -> None:
         """
         Adds new audio data to be played with a feminine touch.
 
